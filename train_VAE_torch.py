@@ -1,13 +1,13 @@
-#!/usr/bin/env python3
-
 import os
 
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
-Gaussian = tfp.distributions.MultivariateNormalDiag
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
+
+import torch
+from torch import distributions as D
+
+from torch.nn import functional as F
 from prdepth.dataset import Dataset
 import prdepth.utils as ut
 from prdepth.net import DORN
@@ -68,6 +68,7 @@ ssave = ut.ckpter(WTS + '/iter_*.state.npz')
 ut.logopen(WTS + '/train.log')
 niter = msave.iter
 
+
 #########################################################################
 # Feature extraction network is DORN (ResNet-101 based), which is pre-trained
 # and fixed when training the VAE.
@@ -75,19 +76,17 @@ niter = msave.iter
 ResNet = ResNet101.ResNet101()
 SceneNet = DORN.DORN()
 
+
 #########################################################################
 # Variables that are persistent across sessions.
 
-gt = tf.Variable(tf.zeros([BSZ, H, W, 1], dtype=tf.float32), trainable=False)
-patched_depth = tf.Variable(
-    tf.zeros([BSZ, HNPS, WNPS, PSZ * PSZ], dtype=tf.float32), trainable=False)
-patched_mask = tf.Variable(
-    tf.zeros([BSZ, HNPS, WNPS, 1], dtype=tf.float32), trainable=False)
+gt = torch.zeros(BSZ, H, W, 1, dtype=torch.float32, requires_grad=False)
+patched_depth = torch.zeros(BSZ, HNPS, WNPS, PSZ * PSZ, dtype=torch.float32, requires_grad=False)
+patched_mask = torch.zeros(BSZ, HNPS, WNPS, 1, dtype=torch.float32, requires_grad=False)
 
-patched_pred = tf.Variable(tf.zeros(
-    [VARIter, BSZ, HNPS, WNPS, PSZ * PSZ], dtype=tf.float32), trainable=False)
-feature = tf.Variable(
-    tf.zeros([BSZ, OH, OW, 2560], dtype=tf.float32), trainable=False)
+patched_pred = torch.zeros(VARIter, BSZ, HNPS, WNPS, PSZ * PSZ, dtype=torch.float32, requires_grad=False)
+feature = torch.zeros(BSZ, OH, OW, 2560, dtype=torch.float32, requires_grad=False)
+
 
 #########################################################################
 # Graph for feature extraction network, which is run multiple times to
@@ -95,7 +94,7 @@ feature = tf.Variable(
 # Extracted features are saved to persistent variables, which can
 # then be used for one training iteration in the VAE training graph/session.
 
-biter = tf.placeholder(shape=[], dtype=tf.int32)
+# biter = tf.placeholder(shape=[], dtype=tf.int32)
 
 tset = Dataset(TLIST, DORN_BSZ, H, W, niter * N_DORN_BATCH,
                isval=False, aug=True, seed=0)
@@ -103,49 +102,58 @@ vset = Dataset(VLIST, DORN_BSZ, H, W, 0, isval=True, aug=False)
 depth, image, swpT, swpV = tset.tvSwap(vset)
 
 # Downsample the original image to the DORN input resolution.
-image = tf.image.resize_images(image, [IH, IW], align_corners=True)
+image = F.interpolate(image, [IH, IW], align_corners=True)
 
-# ResNet
+# ResNet UPDATE HOW??
 feat = ResNet.get_feature(image)
 
 # Scene Understanding
 feat = SceneNet.scene_understand(feat)
+
+#What is hapopening here?
 feature_op = tf.assign(
     feature[biter * DORN_BSZ:(biter + 1) * DORN_BSZ], feat).op
 
-# GT
+# GT and here?
 gt_op = tf.assign(gt[biter * DORN_BSZ:(biter + 1) * DORN_BSZ], depth).op
 
 # Depth patches from downsampled depth map
-down_depth = tf.image.resize_images(depth, [IH, IW], align_corners=True)
+down_depth = F.interpolate(depth, [IH, IW], align_corners=True)
 pdepth = tf.extract_image_patches(down_depth, [1, PSZ, PSZ, 1], [
                                   1, STRIDE, STRIDE, 1], [1, 1, 1, 1], 'VALID')
 depth_op = tf.assign(
     patched_depth[biter * DORN_BSZ:(biter + 1) * DORN_BSZ], pdepth).op
 
 # Masks
-mask = tf.image.resize_images(
-    tf.to_float(depth > 0), [IH, IW], align_corners=True)
+mask = F.interpolate(
+    (depth > 0).float(), [IH, IW], align_corners=True)
+
 mask = tf.extract_image_patches(
     mask, [1, PSZ, PSZ, 1], [1, STRIDE, STRIDE, 1], [1, 1, 1, 1], 'VALID')
+
+
 mask = tf.to_float(tf.reduce_all(tf.equal(mask, 1.0), axis=-1, keepdims=True))
 mask_op = tf.assign(patched_mask[biter * DORN_BSZ:(biter + 1) * DORN_BSZ], mask)
 
 prepare_op = tf.group([feature_op, gt_op, depth_op, mask_op])
 
 
+
+
+
+
 #########################################################################
 # Graph for training VAE, which uses features from feature extractor
 # The VAE contains three parts and is trained as follows:
-#   prior net: 
+#   prior net:
 #       input: features for each patch from the RGB image.
 #       output: mean and log-sigma for prior distribution of the latent code.
 #       trained by: minimizing kl divergence versus the posterior distribution.
 #   posterior net:
 #       input: features for each patch from the RGB image, depth for each patch.
-#       output: mean and log-sigma for posterior distribution of the latent 
+#       output: mean and log-sigma for posterior distribution of the latent
 #               code.
-#       trained by: minimizing the l1 loss between the GT depth and the 
+#       trained by: minimizing the l1 loss between the GT depth and the
 #                   generated depth by using a sampled latent code from this
 #                   posterior distribution.
 #   generator:
@@ -156,34 +164,34 @@ prepare_op = tf.group([feature_op, gt_op, depth_op, mask_op])
 #
 # At inference time, posterior net will be discarded. We will run the feature
 # extractor once to get features for each patch, and then run the prior net once
-# to get the prior distribution. We then sample from the prior distribution 
+# to get the prior distribution. We then sample from the prior distribution
 # to get multiple latent codes and run the generator multiple times to sample
 # multiple depth predictions (samples) for each patch.
 
-
+#May change this put
 if OH != FH:
-    feature = tf.image.resize_bilinear(feature, [FH, FW], align_corners=True)
+    feature = F.interpolate(feature, [FH, FW], align_corners=True)
 
 VAE_model = VAE.VAE(latent_dim=LATENT_DIM)
+
+#plug in DORN features into VAE model
 
 prior_mean, prior_log_sigma = VAE_model.prior_net(feature)
 posterior_mean, posterior_log_sigma = VAE_model.posterior_net(
     feature, patched_depth)
 
-prior = Gaussian(loc=prior_mean, scale_diag=tf.exp(prior_log_sigma))
-posterior = Gaussian(loc=posterior_mean,
-                     scale_diag=tf.exp(posterior_log_sigma))
+prior = D.Independent(D.normal(loc=prior_mean, scale_diag=tf.exp(prior_log_sigma)),1)
+posterior = D.Independent(D.normal(loc=posterior_mean,scale_diag=tf.exp(posterior_log_sigma)),1)
 
 posterior_latent = posterior.sample()
 depth_pred = VAE_model.generate(feature, posterior_latent)
 
-l1_loss = tf.reduce_mean(
-    tf.abs(depth_pred - patched_depth), axis=-1, keepdims=True)
-l1_loss = tf.reduce_sum(l1_loss * patched_mask)
+l1_loss = torch.mean(torch.abs(depth_pred - patched_depth), axis=-1, keepdims=True)
+l1_loss = torch.sum(l1_loss * patched_mask)
 
 # KL divergence
-kl_loss = tfp.distributions.kl_divergence(posterior, prior)
-kl_loss = tf.reduce_sum(kl_loss[..., None] * patched_mask)
+kl_loss = D.kl_divergence(posterior, prior)
+kl_loss = torch.sum(kl_loss[..., None] * patched_mask)
 
 loss = l1_loss + kl_loss * LMD
 
@@ -193,7 +201,7 @@ opt = tf.train.AdamOptimizer(lr, beta1=BETA1, beta2=BETA2)
 tstep = opt.minimize(loss, var_list=list(VAE_model.weights.values()))
 
 # Get loss to print
-nvalids = tf.reduce_sum(patched_mask)
+nvalids = torch.sum(patched_mask)
 lvals = [loss / nvalids, l1_loss / nvalids, kl_loss / nvalids]
 lnms = ['loss', 'L1', 'KL']
 tnms = [l + '.t' for l in lnms]
@@ -204,7 +212,7 @@ l2_op = tf.assign(patched_pred[l2_iter], depth_pred).op
 
 
 #########################################################################
-# Graph to compute average and min L2 loss using samples generated with VAE.
+# Graph to compute average and min L2 loss using samples generated with VAE. UPdate this somehow??? also
 
 # A patch extractor to extract and group patches.
 PO = ut.PatchOp(BSZ, IH, IW, PSZ, STRIDE)
@@ -263,6 +271,8 @@ if niter > 0:
     ut.mprint("Restoring state from " + sfn)
     ut.load_adam(sfn, opt, VAE_model.weights, sess)
     ut.mprint("Done!")
+
+
 
 
 #########################################################################
