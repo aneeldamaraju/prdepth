@@ -66,7 +66,7 @@ if not os.path.exists(WTS):
 msave = ut.ckpter(WTS + '/iter_*.model.npz')
 ssave = ut.ckpter(WTS + '/iter_*.state.npz')
 ut.logopen(WTS + '/train.log')
-niter = msave.iter
+niter =  msave.iter
 
 #########################################################################
 # Feature extraction network is DORN (ResNet-101 based), which is pre-trained
